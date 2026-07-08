@@ -9,7 +9,41 @@
 
 #include <workerd/util/uuid.h>
 
+#include <kj/common.h>
+#include <kj/mutex.h>
+
 namespace workerd {
+
+namespace {
+// Maps each hibernatable WebSocket event ID currently being delivered to the manager that owns the
+// socket. The registry is process-global because delivery can cross event loops, but the manager,
+// its native WebSockets, and its JavaScript state remain bound to their originating thread.
+//
+// Lock-order invariant: code that needs both this registry and a manager's
+// webSocketsForEventHandler lock must take this global lock first, then the per-manager lock. These
+// nested critical sections are slow-path event-delivery bookkeeping and must keep the two maps
+// consistent.
+struct RegisteredManager {
+  kj::ThreadId threadId;
+
+  // Non-owning, and must stay that way: an owning reference would keep the manager alive for as
+  // long as an event is registered, and erasing the last one (which happens under both locks, e.g.
+  // in cancelEvent()) would run the destructor re-entrantly and deadlock on the non-recursive
+  // mutexes. `~LegacyHibernationManagerImpl` erases its own entries, so a pointer here is always
+  // live. Only findManagerForEvent() addRefs through it, and it checks `threadId` first, since
+  // kj::Refcounted is not threadsafe.
+  LegacyHibernationManagerImpl* manager;
+};
+
+const kj::MutexGuarded<kj::HashMap<kj::String, RegisteredManager>>&
+getManagersByEventWebSocketId() {
+  // Intentionally process-lifetime, to avoid depending on static destruction order during process
+  // teardown: a manager outliving the registry would leave its destructor scanning freed memory.
+  static const auto* const managers =
+      new kj::MutexGuarded<kj::HashMap<kj::String, RegisteredManager>>();
+  return *managers;
+}
+}  // namespace
 
 LegacyHibernationManagerImpl::HibernatableWebSocket::HibernatableWebSocket(
     jsg::Ref<api::WebSocket> websocket,
@@ -93,6 +127,21 @@ LegacyHibernationManagerImpl::~LegacyHibernationManagerImpl() noexcept(false) {
 
   // Note that the HibernatableWebSocket destructor handles removing any references to itself in
   // `tagToWs`, and even removes the hashmap entry if there are no more entries in the bucket.
+  {
+    auto managers = getManagersByEventWebSocketId().lockExclusive();
+    auto webSockets = webSocketsForEventHandler.lockExclusive();
+
+    // Scan the whole registry: it holds non-owning pointers, so every entry still naming this
+    // manager has to go, including any whose `webSockets` entry was already removed.
+    managers->eraseAll([this](kj::StringPtr, RegisteredManager& registered) {
+      if (registered.manager != this) return false;
+      registered.threadId.assertCurrentThread();
+      return true;
+    });
+
+    webSockets->clear();
+  }
+
   allWs.clear();
   KJ_ASSERT(tagToWs.size() == 0, "tagToWs hashmap wasn't cleared.");
 }
@@ -246,6 +295,168 @@ kj::Maybe<uint32_t> LegacyHibernationManagerImpl::getEventTimeout() {
   return eventTimeoutMs;
 }
 
+kj::Maybe<kj::Own<Worker::Actor::HibernationManager>> LegacyHibernationManagerImpl::
+    findManagerForEvent(kj::StringPtr websocketId) {
+  // A shared lock is enough: this only reads the map, and holding it still excludes the erasers, so
+  // a matching entry's manager stays alive across the addRef() below.
+  auto managers = getManagersByEventWebSocketId().lockShared();
+  KJ_IF_SOME(manager, managers->find(websocketId)) {
+    if (manager.threadId != kj::ThreadId::current()) return kj::none;
+    return manager.manager->addRef();
+  }
+  return kj::none;
+}
+
+LegacyHibernationManagerImpl::HibernatableWebSocket& LegacyHibernationManagerImpl::
+    takeWebSocketForEvent(kj::StringPtr websocketId) {
+  auto& actor = KJ_REQUIRE_NONNULL(IoContext::current().getActor());
+  KJ_IF_SOME(manager, actor.getHibernationManager()) {
+    auto& legacyManager = kj::downcast<LegacyHibernationManagerImpl>(manager);
+    KJ_IF_SOME(hibernatableWebSocket, legacyManager.tryTakeWebSocketForEventHandler(websocketId)) {
+      return hibernatableWebSocket;
+    }
+  }
+
+  KJ_IF_SOME(hibernatableWebSocket, tryTakeWebSocketForGlobalEvent(websocketId)) {
+    return hibernatableWebSocket;
+  }
+
+  KJ_FAIL_REQUIRE("hibernatable WebSocket event missing instance map entry", websocketId);
+}
+
+kj::Maybe<LegacyHibernationManagerImpl::HibernatableWebSocket&> LegacyHibernationManagerImpl::
+    tryTakeWebSocketForGlobalEvent(kj::StringPtr websocketId) {
+  auto managers = getManagersByEventWebSocketId().lockExclusive();
+  KJ_IF_SOME(entry, managers->findEntry(websocketId)) {
+    if (entry.value.threadId != kj::ThreadId::current()) return kj::none;
+
+    // Erase on every exit path below. An entry whose instance-map counterpart is gone or
+    // inconsistent is stale, and stranding it here would keep it in the registry until the manager
+    // is destroyed -- cancelEvent() relies on a missing instance entry meaning the registry is
+    // clear too.
+    KJ_DEFER(managers->erase(entry));
+
+    auto taken =
+        KJ_REQUIRE_NONNULL(entry.value.manager->tryTakeWebSocketForEventHandlerImpl(websocketId),
+            "hibernatable WebSocket event missing instance map entry", websocketId);
+    KJ_ASSERT(taken.registeredGlobally,
+        "hibernatable WebSocket event manager registry pointed to unregistered instance entry",
+        websocketId);
+    return *taken.webSocket;
+  }
+
+  return kj::none;
+}
+
+void LegacyHibernationManagerImpl::putWebSocketForEventHandler(
+    kj::String websocketId, HibernatableWebSocket& hib) {
+  auto websocketIdPtr = websocketId.asPtr();
+  auto webSockets = webSocketsForEventHandler.lockExclusive();
+  KJ_ASSERT(webSockets->find(websocketIdPtr) == kj::none,
+      "duplicate hibernatable WebSocket event ID", websocketIdPtr);
+  webSockets->insert(kj::mv(websocketId), EventWebSocketEntry{&hib});
+}
+
+void LegacyHibernationManagerImpl::registerManagerForEvent(kj::StringPtr websocketId) {
+  auto managers = getManagersByEventWebSocketId().lockExclusive();
+  auto webSockets = webSocketsForEventHandler.lockExclusive();
+  auto& entry = KJ_REQUIRE_NONNULL(webSockets->findEntry(websocketId),
+      "hibernatable WebSocket event missing instance map entry", websocketId);
+  if (entry.value.registeredGlobally) {
+    auto& manager = KJ_REQUIRE_NONNULL(managers->find(websocketId),
+        "hibernatable WebSocket event missing manager registry entry", websocketId);
+    manager.threadId.assertCurrentThread();
+    KJ_ASSERT(manager.manager == this,
+        "hibernatable WebSocket event registered to a different manager", websocketId);
+    return;
+  }
+
+  KJ_ASSERT(managers->find(websocketId) == kj::none,
+      "duplicate hibernatable WebSocket event manager", websocketId);
+  managers->insert(kj::str(websocketId), RegisteredManager{kj::ThreadId::current(), this});
+  entry.value.registeredGlobally = true;
+}
+
+void LegacyHibernationManagerImpl::cancelEvent(kj::StringPtr websocketId) {
+  {
+    // Only RPC dispatch and cross-manager wakes reach the process-global registry, so most events
+    // can be cleaned up under this manager's own lock. A missing instance entry means the event was
+    // already claimed, and the claim paths clear the registry alongside it.
+    auto webSockets = webSocketsForEventHandler.lockExclusive();
+    KJ_IF_SOME(entry, webSockets->findEntry(websocketId)) {
+      if (!entry.value.registeredGlobally) {
+        webSockets->erase(entry);
+        return;
+      }
+    } else {
+      return;
+    }
+  }
+
+  auto managers = getManagersByEventWebSocketId().lockExclusive();
+  auto webSockets = webSocketsForEventHandler.lockExclusive();
+  KJ_IF_SOME(manager, managers->findEntry(websocketId)) {
+    manager.value.threadId.assertCurrentThread();
+    KJ_ASSERT(manager.value.manager == this,
+        "hibernatable WebSocket event registered to a different manager", websocketId);
+    managers->erase(manager);
+  }
+  KJ_IF_SOME(entry, webSockets->findEntry(websocketId)) {
+    webSockets->erase(entry);
+  }
+}
+
+kj::Maybe<LegacyHibernationManagerImpl::HibernatableWebSocket&> LegacyHibernationManagerImpl::
+    tryTakeWebSocketForEventHandler(kj::StringPtr websocketId) {
+  {
+    auto webSockets = webSocketsForEventHandler.lockExclusive();
+    KJ_IF_SOME(entry, webSockets->findEntry(websocketId)) {
+      if (!entry.value.registeredGlobally) {
+        auto& webSocket = *entry.value.webSocket;
+        webSockets->erase(websocketId);
+        return webSocket;
+      }
+    } else {
+      return kj::none;
+    }
+  }
+
+  auto managers = getManagersByEventWebSocketId().lockExclusive();
+  auto webSockets = webSocketsForEventHandler.lockExclusive();
+  KJ_IF_SOME(entry, webSockets->findEntry(websocketId)) {
+    KJ_ASSERT(entry.value.registeredGlobally,
+        "hibernatable WebSocket event manager registry pointed to unregistered instance entry",
+        websocketId);
+
+    KJ_IF_SOME(registeredEntry, managers->findEntry(websocketId)) {
+      registeredEntry.value.threadId.assertCurrentThread();
+      KJ_ASSERT(registeredEntry.value.manager == this,
+          "hibernatable WebSocket event registered to a different manager", websocketId);
+
+      auto& webSocket = *entry.value.webSocket;
+      webSockets->erase(websocketId);
+      managers->erase(registeredEntry);
+      return webSocket;
+    }
+  }
+
+  return kj::none;
+}
+
+kj::Maybe<LegacyHibernationManagerImpl::TakenEventWebSocket> LegacyHibernationManagerImpl::
+    tryTakeWebSocketForEventHandlerImpl(kj::StringPtr websocketId) {
+  auto webSockets = webSocketsForEventHandler.lockExclusive();
+  KJ_IF_SOME(entry, webSockets->findEntry(websocketId)) {
+    auto& webSocket = *entry.value.webSocket;
+    auto registeredGlobally = entry.value.registeredGlobally;
+
+    webSockets->erase(websocketId);
+    return TakenEventWebSocket{&webSocket, registeredGlobally};
+  }
+
+  return kj::none;
+}
+
 void LegacyHibernationManagerImpl::dropHibernatableWebSocket(HibernatableWebSocket& hib) {
   removeFromAllWs(hib);
 }
@@ -261,7 +472,7 @@ kj::Promise<void> LegacyHibernationManagerImpl::handleSocketTermination(
   kj::String eventWebSocketId;
   KJ_DEFER({
     if (eventWebSocketId.size() > 0) {
-      webSocketsForEventHandler.erase(eventWebSocketId);
+      cancelEvent(eventWebSocketId);
     }
     dropHibernatableWebSocket(hib);
   });
@@ -270,7 +481,7 @@ kj::Promise<void> LegacyHibernationManagerImpl::handleSocketTermination(
   KJ_IF_SOME(error, maybeError) {
     auto websocketId = randomUUID(kj::none);
     eventWebSocketId = kj::str(websocketId);
-    webSocketsForEventHandler.insert(kj::str(websocketId), &hib);
+    putWebSocketForEventHandler(kj::str(websocketId), hib);
     kj::Maybe<api::HibernatableSocketParams> params;
     if (!hib.hasDispatchedClose && (error.getType() == kj::Exception::Type::DISCONNECTED)) {
       // If premature disconnect/cancel, dispatch a close event if we haven't already.
@@ -284,14 +495,7 @@ kj::Promise<void> LegacyHibernationManagerImpl::handleSocketTermination(
     }
 
     KJ_REQUIRE_NONNULL(params).setTimeout(eventTimeoutMs);
-    // Dispatch the event, restoring the trace context captured at acceptWebSocket time.
-    SpanParent userSpanParent = SpanParent(nullptr);
-    KJ_IF_SOME(ctx, hib.userSpanContext) {
-      userSpanParent = SpanParent::fromSpanContext(tracing::SpanContext::clone(ctx));
-    }
-    auto workerInterface = loopback->getWorker({
-      .userSpanParent = kj::mv(userSpanParent),
-    });
+    auto workerInterface = getWorkerForEvent(hib);
     event = workerInterface
                 ->customEvent(kj::rc<api::HibernatableWebSocketCustomEvent>(
                     hibernationEventType, kj::mv(KJ_REQUIRE_NONNULL(params)), *this)
@@ -305,6 +509,20 @@ kj::Promise<void> LegacyHibernationManagerImpl::handleSocketTermination(
   KJ_IF_SOME(promise, event) {
     co_await promise;
   }
+}
+
+kj::Own<WorkerInterface> LegacyHibernationManagerImpl::getWorkerForEvent(
+    HibernatableWebSocket& hib) {
+  SpanParent userSpanParent = SpanParent(nullptr);
+  KJ_IF_SOME(ctx, hib.userSpanContext) {
+    userSpanParent = SpanParent::fromSpanContext(tracing::SpanContext::clone(ctx));
+  }
+  return loopback->getWorker({
+    .userSpanParent = kj::mv(userSpanParent),
+    .forceFreshActorCode = hib.activeOrPackage.is<api::WebSocket::HibernationPackage>()
+        ? ForceFreshActorCode::YES
+        : ForceFreshActorCode::NO,
+  });
 }
 
 kj::Promise<void> LegacyHibernationManagerImpl::readLoop(HibernatableWebSocket& hib) {
@@ -382,8 +600,8 @@ kj::Promise<void> LegacyHibernationManagerImpl::readLoop(HibernatableWebSocket& 
 
     auto websocketId = randomUUID(kj::none);
     auto eventWebSocketId = kj::str(websocketId);
-    webSocketsForEventHandler.insert(kj::str(websocketId), &hib);
-    KJ_DEFER(webSocketsForEventHandler.erase(eventWebSocketId));
+    putWebSocketForEventHandler(kj::str(websocketId), hib);
+    KJ_DEFER(cancelEvent(eventWebSocketId));
 
     // Build the event params depending on what type of message we got.
     kj::Maybe<api::HibernatableSocketParams> maybeParams;
@@ -405,14 +623,7 @@ kj::Promise<void> LegacyHibernationManagerImpl::readLoop(HibernatableWebSocket& 
     auto params = kj::mv(KJ_REQUIRE_NONNULL(maybeParams));
     params.setTimeout(eventTimeoutMs);
     auto isClose = params.isCloseEvent();
-    // Dispatch the event, restoring the trace context captured at acceptWebSocket time.
-    SpanParent userSpanParent = SpanParent(nullptr);
-    KJ_IF_SOME(ctx, hib.userSpanContext) {
-      userSpanParent = SpanParent::fromSpanContext(tracing::SpanContext::clone(ctx));
-    }
-    auto workerInterface = loopback->getWorker({
-      .userSpanParent = kj::mv(userSpanParent),
-    });
+    auto workerInterface = getWorkerForEvent(hib);
     co_await workerInterface->customEvent(
         kj::rc<api::HibernatableWebSocketCustomEvent>(hibernationEventType, kj::mv(params), *this)
             .toOwn());

@@ -11,6 +11,7 @@
 #include <workerd/jsg/jsg.h>
 
 #include <kj/exception.h>
+#include <kj/mutex.h>
 
 #include <list>
 
@@ -46,6 +47,7 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
   kj::Own<HibernationManager> addRef() override;
 
   friend class api::HibernatableWebSocketEvent;
+  friend class api::HibernatableWebSocketCustomEvent;
 
   // Sets/Unset the maximum time in milliseconds that an hibernatable websocket event can run for.
   // If the timeout is reached, event is canceled.
@@ -53,6 +55,13 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
 
   // Gets the event timeout if set.
   kj::Maybe<uint32_t> getEventTimeout() override;
+
+  // Returns an owning reference to the hibernation manager that registered `websocketId` for the
+  // hibernatable WebSocket event currently being delivered. Returns kj::none when the event ID was
+  // not registered in this runtime, e.g. because the event did not originate from a legacy
+  // hibernation manager here.
+  static kj::Maybe<kj::Own<Worker::Actor::HibernationManager>> findManagerForEvent(
+      kj::StringPtr websocketId);
 
  private:
   class HibernatableWebSocket;
@@ -152,6 +161,44 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
   // Removes the HibernatableWebSocket from `allWs`.
   inline void removeFromAllWs(HibernatableWebSocket& hib);
 
+  struct TakenEventWebSocket {
+    HibernatableWebSocket* webSocket;
+    bool registeredGlobally;
+  };
+
+  // Removes and returns the WebSocket for the event currently being delivered. First checks the
+  // current actor's hibernation manager, then the global cross-manager registry, and fails if no
+  // manager owns the event ID.
+  static HibernatableWebSocket& takeWebSocketForEvent(kj::StringPtr websocketId);
+
+  // Removes and returns the WebSocket for an RPC or cross-manager event by resolving its manager
+  // through the process-global event registry.
+  static kj::Maybe<HibernatableWebSocket&> tryTakeWebSocketForGlobalEvent(
+      kj::StringPtr websocketId);
+
+  // Records the WebSocket against an event ID in this manager's instance map, so the handler that
+  // runs next can claim it. Leaves the process-global registry alone; see registerManagerForEvent().
+  void putWebSocketForEventHandler(kj::String websocketId, HibernatableWebSocket& hib);
+
+  // Removes and returns the WebSocket for the event currently being delivered, if this manager
+  // owns it.
+  kj::Maybe<HibernatableWebSocket&> tryTakeWebSocketForEventHandler(kj::StringPtr websocketId);
+  kj::Maybe<TakenEventWebSocket> tryTakeWebSocketForEventHandlerImpl(kj::StringPtr websocketId);
+
+  // Registers this manager in the cross-thread registry for a WebSocket ID already present in the
+  // instance map. Only needed when dispatch has to cross an RPC boundary, or when a local event has
+  // to override the actor's current hibernation manager. The registry owns its copy of the ID.
+  void registerManagerForEvent(kj::StringPtr websocketId);
+
+  // Removes an event from both the instance and process-global maps. Safe to call after the
+  // receiver already claimed the event.
+  void cancelEvent(kj::StringPtr websocketId);
+
+  // Returns a worker to dispatch an event for `hib` on, carrying the trace context captured when
+  // the WebSocket was accepted. A socket whose api::WebSocket is still packaged away is hibernated,
+  // so the wake asks for fresh actor code: the pipeline may have been updated while it slept.
+  kj::Own<WorkerInterface> getWorkerForEvent(HibernatableWebSocket& hib);
+
   // Handles the termination of the websocket. If termination was not clean, we might try to
   // dispatch a close event (if we haven't already), or an error event.
   // We will also remove the HibernatableWebSocket from the HibernationManager's collections.
@@ -202,7 +249,13 @@ class LegacyHibernationManagerImpl final: public Worker::Actor::HibernationManag
   // around the same time. Suppose there are two websockets that disconnect at the same time.
   // It is possible that both of them will be added to the map (i.e. their `receive()`
   // will throw) before the first event is dispatched and manages to obtain its associated websocket.
-  kj::HashMap<kj::String, HibernatableWebSocket*> webSocketsForEventHandler;
+  // When accessing this map together with the process-global event manager registry, lock the global
+  // registry first, then this per-manager map.
+  struct EventWebSocketEntry {
+    HibernatableWebSocket* webSocket;
+    bool registeredGlobally = false;
+  };
+  kj::MutexGuarded<kj::HashMap<kj::String, EventWebSocketEntry>> webSocketsForEventHandler;
 
   // The maximum number of Hibernatable WebSocket connections a single LegacyHibernationManagerImpl
   // instance can manage.

@@ -31,6 +31,7 @@ class WorkerInterface;
 // bindings of a flag-enabled worker are `Persistent::YES`; everything else is `Persistent::NO`.
 // A `Persistent::YES` channel/token may be stored in long-term storage; `Persistent::NO` may not.
 WD_STRONG_BOOL(Persistent);
+WD_STRONG_BOOL(ForceFreshActorCode);
 
 // Interface for talking to the Cache API. Needs to be declared here so that IoContext can
 // contain it.
@@ -136,6 +137,12 @@ class IoChannelFactory: public virtual kj::Refcounted {
 
     // User Span Parent for trace propagation. Call toSpanContext() to serialize.
     SpanParent userSpanParent = SpanParent(nullptr);
+
+    // Hibernatable WebSocket events wake an actor from outside a normal request path. If the actor's
+    // mutable pipeline was updated while it was hibernated, runtimes that support mutable actor code
+    // updates should consume this metadata to re-resolve the mutable pipeline before delivering the
+    // wake event.
+    ForceFreshActorCode forceFreshActorCode = ForceFreshActorCode::NO;
 
     // Serialized JSON value to pass in ew_compat field of control header to FL. If this subrequest
     // does not go directly to FL, this value is ignored. Flags marked with `$neededByFl` in

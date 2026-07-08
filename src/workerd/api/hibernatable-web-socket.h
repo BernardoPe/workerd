@@ -50,14 +50,14 @@ class HibernatableWebSocketEvent final: public ExtendableEvent {
   JSG_RESOURCE_TYPE(HibernatableWebSocketEvent) {
     JSG_INHERIT(ExtendableEvent);
   }
-
- private:
-  Worker::Actor::HibernationManager& getHibernationManager(jsg::Lock& lock);
 };
 
 class HibernatableWebSocketCustomEvent final: public WorkerInterface::CustomEvent,
                                               public kj::Refcounted {
  public:
+  // Local wake events hold an owning manager ref. RPC wake events cannot carry a C++ reference, so
+  // they pass kj::none and run() falls back to LegacyHibernationManagerImpl::findManagerForEvent()
+  // using the event's WebSocket ID.
   HibernatableWebSocketCustomEvent(uint16_t typeId,
       kj::Own<HibernationReader> params,
       kj::Maybe<Worker::Actor::HibernationManager&> manager = kj::none);
@@ -91,13 +91,20 @@ class HibernatableWebSocketCustomEvent final: public WorkerInterface::CustomEven
   // HibernatableSocketParams first.
   HibernatableSocketParams consumeParams();
 
+  // Makes the manager that owns `websocketId` reachable for this event. It is installed on the actor
+  // when the actor has none; if the actor already holds a different one -- a code-update wake
+  // replaced it -- that one stays and delivery reaches the owner through the process-global registry
+  // instead. Local events carry an owning ref; RPC events resolve one from the registry.
+  void ensureHibernationManagerForEvent(Worker::Actor& actor, kj::StringPtr websocketId);
+
   // Peeks at params to extract the event type for tracing, without consuming them.
   tracing::HibernatableWebSocketEventInfo::Type getEventType() const;
 
   uint16_t typeId;
   kj::OneOf<HibernatableSocketParams, kj::Own<HibernationReader>> params;
   kj::Maybe<uint32_t> timeoutMs;
-  kj::Maybe<Worker::Actor::HibernationManager&> manager;
+  kj::Maybe<kj::Own<Worker::Actor::HibernationManager>> manager;
+  bool eventRegisteredGlobally = false;
 };
 
 #define EW_WEB_SOCKET_MESSAGE_ISOLATE_TYPES                                                        \
