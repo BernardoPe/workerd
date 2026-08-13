@@ -7,6 +7,7 @@
 #include <workerd/jsg/jsg.h>
 
 #include <v8-value-serializer.h>
+#include <v8-wasm.h>
 
 #include <kj/vector.h>
 
@@ -117,6 +118,13 @@ class Serializer final: v8::ValueSerializer::Delegate {
     //   itself, but it may not be worth it to support for only that use case.
     bool treatClassInstancesAsPlainObjects = true;
 
+    // If true, instances of WebAssembly.Module can be serialized. Their compiled code is
+    // collected in `Released::wasmModules`, which must be passed along to the deserializer.
+    // Since compiled code can only be shared within the same process, this must only be enabled
+    // when the data will be deserialized in-process (e.g. structuredClone()), never when the
+    // data may be persisted or sent over the wire.
+    bool supportWasmModules = false;
+
     // ExternalHandler, if any. Typically this would be allocated on the stack just before the
     // Serializer.
     kj::Maybe<ExternalHandler&> externalHandler;
@@ -132,6 +140,11 @@ class Serializer final: v8::ValueSerializer::Delegate {
 
     // All ArrayBuffers that were passed to `transfer()`.
     kj::Array<std::shared_ptr<v8::BackingStore>> transferredArrayBuffers;
+
+    // Compiled code of all instances of WebAssembly.Module seen during serialization (only
+    // possible when `Options::supportWasmModules` was enabled). Pass these along to the
+    // deserializer to share the compiled code.
+    kj::Array<v8::CompiledWasmModule> wasmModules;
   };
 
   explicit Serializer(Lock& js): Serializer(js, {}) {}
@@ -195,6 +208,9 @@ class Serializer final: v8::ValueSerializer::Delegate {
   v8::Maybe<uint32_t> GetSharedArrayBufferId(
       v8::Isolate* isolate, v8::Local<v8::SharedArrayBuffer> sab) override;
 
+  v8::Maybe<uint32_t> GetWasmModuleTransferId(
+      v8::Isolate* isolate, v8::Local<v8::WasmModuleObject> module) override;
+
   kj::Maybe<ExternalHandler&> externalHandler;
 
   kj::Vector<jsg::JsRef<JsValue>> sharedArrayBuffers;
@@ -204,6 +220,8 @@ class Serializer final: v8::ValueSerializer::Delegate {
   kj::Vector<jsg::V8Ref<v8::ArrayBuffer>> arrayBuffersToDetach;
   kj::Vector<std::shared_ptr<v8::BackingStore>> sharedBackingStores;
   kj::Vector<std::shared_ptr<v8::BackingStore>> backingStores;
+  kj::Vector<v8::CompiledWasmModule> wasmModules;
+  bool supportWasmModules;
   bool released = false;
   bool treatClassInstancesAsPlainObjects;
   bool treatErrorsAsHostObjects = false;
@@ -241,6 +259,12 @@ class Deserializer final: v8::ValueDeserializer::Delegate {
     // This flag has no effect if the enhanced error serialization feature is disabled,
     // or the values being deserialized are not errors (or do not contain any error objects).
     bool preserveStackInErrors = true;
+
+    // Compiled WebAssembly modules collected by the serializer (see
+    // `Serializer::Options::supportWasmModules`). If none, deserializing a WebAssembly.Module
+    // throws DataCloneError. This is filled in automatically when constructing from a
+    // `Serializer::Released`.
+    kj::Maybe<kj::ArrayPtr<const v8::CompiledWasmModule>> wasmModules;
 
     // ExternalHandler, if any. Typically this would be allocated on the stack just before the
     // Deserializer.
@@ -292,6 +316,8 @@ class Deserializer final: v8::ValueDeserializer::Delegate {
 
   v8::MaybeLocal<v8::SharedArrayBuffer> GetSharedArrayBufferFromId(
       v8::Isolate* isolate, uint32_t clone_id) override;
+  v8::MaybeLocal<v8::WasmModuleObject> GetWasmModuleFromId(
+      v8::Isolate* isolate, uint32_t transfer_id) override;
   v8::MaybeLocal<v8::Object> ReadHostObject(v8::Isolate* isolate) override;
 
   kj::Maybe<ExternalHandler&> externalHandler;
@@ -299,6 +325,7 @@ class Deserializer final: v8::ValueDeserializer::Delegate {
   size_t totalInputSize;
   v8::ValueDeserializer deser;
   kj::Maybe<kj::ArrayPtr<std::shared_ptr<v8::BackingStore>>> sharedBackingStores;
+  kj::Maybe<kj::ArrayPtr<const v8::CompiledWasmModule>> wasmModules;
   bool preserveStackInErrors = true;
 };
 

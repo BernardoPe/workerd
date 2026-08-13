@@ -1,7 +1,7 @@
 // Copyright (c) 2025 Cloudflare, Inc.
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
-import { rejects, ok } from 'node:assert';
+import { rejects, ok, strictEqual } from 'node:assert';
 
 export const test = {
   async test() {
@@ -25,6 +25,21 @@ export const wasmSourcePhaseTest = {
   async test() {
     ok(wasmSource instanceof WebAssembly.Module);
     await WebAssembly.instantiate(wasmSource, {});
+  },
+};
+
+export const wasmStructuredCloneTest = {
+  async test() {
+    const clone = structuredClone(wasmSource);
+    ok(clone instanceof WebAssembly.Module);
+    ok(clone !== wasmSource);
+    const instance = await WebAssembly.instantiate(clone, {});
+    strictEqual(instance.exports.add(5, 7), 12);
+
+    // Also clones nested inside other values, deduplicating repeated references.
+    const { a, b } = structuredClone({ a: wasmSource, b: wasmSource });
+    ok(a instanceof WebAssembly.Module);
+    strictEqual(a, b);
   },
 };
 

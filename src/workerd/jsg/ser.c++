@@ -133,6 +133,7 @@ void Serializer::ExternalHandler::serializeProxy(
 
 Serializer::Serializer(Lock& js, Options options)
     : externalHandler(options.externalHandler),
+      supportWasmModules(options.supportWasmModules),
       treatClassInstancesAsPlainObjects(options.treatClassInstancesAsPlainObjects),
       treatErrorsAsHostObjects(js.isUsingEnhancedErrorSerialization()),
       ser(js.v8Isolate, this) {
@@ -169,6 +170,20 @@ v8::Maybe<uint32_t> Serializer::GetSharedArrayBufferId(
   }
   sharedArrayBuffers.add(jsg::JsRef(js, value));
   sharedBackingStores.add(sab->GetBackingStore());
+  return v8::Just(n);
+}
+
+v8::Maybe<uint32_t> Serializer::GetWasmModuleTransferId(
+    v8::Isolate* isolate, v8::Local<v8::WasmModuleObject> module) {
+  if (!supportWasmModules) {
+    // Returning nothing will cause V8 to throw a DataCloneError.
+    return v8::Nothing<uint32_t>();
+  }
+
+  // Note that V8's ValueSerializer deduplicates repeated writes of the same object itself, so
+  // we're only called once per distinct module.
+  uint32_t n = wasmModules.size();
+  wasmModules.add(module->GetCompiledModule());
   return v8::Just(n);
 }
 
@@ -362,6 +377,7 @@ Serializer::Released Serializer::release() {
     .data = kj::Array(pair.first, pair.second, jsg::SERIALIZED_BUFFER_DISPOSER),
     .sharedArrayBuffers = sharedBackingStores.releaseAsArray(),
     .transferredArrayBuffers = backingStores.releaseAsArray(),
+    .wasmModules = wasmModules.releaseAsArray(),
   };
 }
 
@@ -448,13 +464,20 @@ Deserializer::Deserializer(
           released.data.asPtr(),
           released.transferredArrayBuffers.asPtr(),
           released.sharedArrayBuffers.asPtr(),
-          kj::mv(maybeOptions)) {}
+          [&]() -> Options {
+            auto options = kj::mv(maybeOptions).orDefault({});
+            if (options.wasmModules == kj::none) {
+              options.wasmModules = released.wasmModules.asPtr();
+            }
+            return options;
+          }()) {}
 
 void Deserializer::init(Lock& js,
     kj::Maybe<kj::ArrayPtr<std::shared_ptr<v8::BackingStore>>> transferredArrayBuffers,
     kj::Maybe<Options> maybeOptions) {
   auto options = kj::mv(maybeOptions).orDefault({});
   externalHandler = options.externalHandler;
+  wasmModules = options.wasmModules;
   if (options.readHeader) {
     check(deser.ReadHeader(js.v8Context()));
   }
@@ -513,6 +536,16 @@ v8::MaybeLocal<v8::SharedArrayBuffer> Deserializer::GetSharedArrayBufferFromId(
     return v8::SharedArrayBuffer::New(isolate, backingStores[clone_id]);
   }
   return v8::MaybeLocal<v8::SharedArrayBuffer>();
+}
+
+v8::MaybeLocal<v8::WasmModuleObject> Deserializer::GetWasmModuleFromId(
+    v8::Isolate* isolate, uint32_t transferId) {
+  KJ_IF_SOME(modules, wasmModules) {
+    KJ_ASSERT(transferId < modules.size());
+    return v8::WasmModuleObject::FromCompiledModule(isolate, modules[transferId]);
+  }
+  // Returning nothing will cause V8 to throw a DataCloneError.
+  return v8::MaybeLocal<v8::WasmModuleObject>();
 }
 
 v8::MaybeLocal<v8::Object> Deserializer::ReadHostObject(v8::Isolate* isolate) {
@@ -604,7 +637,9 @@ void SerializedBufferDisposer::disposeImpl(void* firstElement,
 
 JsValue structuredClone(
     Lock& js, const JsValue& value, kj::Maybe<kj::Array<JsValue>> maybeTransfer) {
-  Serializer ser(js);
+  // Everything stays in-process, so WebAssembly.Module can be cloned by sharing compiled code,
+  // per the WebAssembly Web API spec.
+  Serializer ser(js, Serializer::Options{.supportWasmModules = true});
   KJ_IF_SOME(transfers, maybeTransfer) {
     for (auto& item: transfers) {
       ser.transfer(js, item);
