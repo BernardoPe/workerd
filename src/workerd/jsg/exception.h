@@ -159,6 +159,9 @@ bool isExceptionFromInputGateBroken(kj::StringPtr description);
 
 constexpr kj::Exception::DetailTypeId EXCEPTION_IS_USER_ERROR = 0x82aff7d637c30e47ull;
 
+// Set when a Durable Object abort should terminate the current alarm without retrying it.
+constexpr kj::Exception::DetailTypeId EXCEPTION_DISABLE_ALARM_RETRY = 0xff8bb5686c6156deull;
+
 struct ExceptionToJsOptions {
   // When ignoreDetail is true, tells kjExceptionToJs() to ignore any serialized
   // exception detail in the kj::Exception.

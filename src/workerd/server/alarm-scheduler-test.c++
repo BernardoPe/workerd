@@ -38,16 +38,31 @@ class AdjustableClock final: public kj::Clock {
   kj::Date time = kj::UNIX_EPOCH;
 };
 
-// Minimal WorkerInterface that only supports runAlarm(); every other entry point is unused by the
-// alarm scheduler tests. runAlarm() reports success (no retry) and invokes `onAlarm` so the test
-// can observe that the alarm fired.
+// Minimal WorkerInterface that supports runAlarm() and abandonAlarm(); every other entry point is
+// unused by the alarm scheduler tests. runAlarm() reports success (no retry) and invokes `onAlarm`
+// so the test can observe that the alarm fired.
 class AlarmStubWorkerInterface final: public WorkerInterface {
  public:
-  explicit AlarmStubWorkerInterface(kj::Function<void()> onAlarm): onAlarm(kj::mv(onAlarm)) {}
+  explicit AlarmStubWorkerInterface(kj::Function<void()> onAlarm)
+      : onAlarm(kj::mv(onAlarm)),
+        onAbandon([]() {}) {}
+
+  AlarmStubWorkerInterface(
+      kj::Function<void()> onAlarm, AlarmOutcome outcome, kj::Function<void()> onAbandon)
+      : onAlarm(kj::mv(onAlarm)),
+        outcome(outcome),
+        onAbandon(kj::mv(onAbandon)) {}
 
   kj::Promise<AlarmResult> runAlarm(kj::Date, uint32_t) override {
     onAlarm();
-    return AlarmResult{.retry = false, .outcome = EventOutcome::OK};
+    return AlarmResult{.retry = outcome.retry,
+      .retryCountsAgainstLimit = outcome.retryCountsAgainstLimit,
+      .outcome = outcome.outcome};
+  }
+
+  kj::Promise<kj::Maybe<kj::Date>> abandonAlarm(kj::Date) override {
+    onAbandon();
+    return kj::Maybe<kj::Date>(kj::none);
   }
 
   kj::Promise<void> request(kj::HttpMethod,
@@ -76,6 +91,8 @@ class AlarmStubWorkerInterface final: public WorkerInterface {
 
  private:
   kj::Function<void()> onAlarm;
+  AlarmOutcome outcome{.retry = false, .outcome = EventOutcome::OK};
+  kj::Function<void()> onAbandon;
 };
 
 KJ_TEST("AlarmScheduler migrates a database created before the actor_name column existed") {
@@ -211,6 +228,44 @@ KJ_TEST("AlarmScheduler restores the persisted actor_name onto the ActorKey when
 
   KJ_EXPECT(fired);
   KJ_EXPECT(KJ_ASSERT_NONNULL(observedName) == "my-name"_kj);
+}
+
+KJ_TEST("AlarmScheduler abandons an alarm when ctx.abort() sets retryAlarm to false") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  AdjustableClock clock;
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
+
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  kj::Path path({"alarms"});
+  auto scheduledTime = kj::UNIX_EPOCH + 1 * kj::HOURS;
+  auto actor = ActorKey{.actorId = "terminal-actor"_kj};
+
+  bool fired = false;
+  bool abandoned = false;
+  auto getActor = [&](const ActorKey&) -> kj::Own<WorkerInterface> {
+    return kj::heap<AlarmStubWorkerInterface>([&fired]() { fired = true; },
+        WorkerInterface::AlarmOutcome{
+          .retry = false,
+          .retryCountsAgainstLimit = true,
+          .outcome = EventOutcome::EXCEPTION,
+        },
+        [&abandoned]() { abandoned = true; });
+  };
+
+  AlarmScheduler scheduler(clock, timer, vfs, path.clone(), kj::mv(getActor));
+  scheduler.setAlarm(actor, scheduledTime);
+
+  clock.setTime(scheduledTime);
+  timer.advanceTo(kj::origin<kj::TimePoint>() + (scheduledTime - kj::UNIX_EPOCH));
+  for (uint i = 0; i < 100 && !abandoned; i++) {
+    waitScope.poll();
+  }
+
+  KJ_EXPECT(fired);
+  KJ_EXPECT(abandoned);
+  KJ_EXPECT(scheduler.getAlarm(actor) == kj::none);
 }
 
 }  // namespace

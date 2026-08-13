@@ -580,6 +580,17 @@ bool isAlarmFailureUserError(kj::StringPtr description, bool hasUserErrorDetail)
   auto tunneled = jsg::tunneledErrorType(description);
   return tunneled.isJsgError && !tunneled.isInternal && !tunneled.isDurableObjectReset;
 }
+
+bool shouldRetryAlarm(const kj::Exception& exception, IoContext& context) {
+  // `exception` is the immediate promise rejection, which may differ from the original context
+  // abort reason after V8 termination or an output-gate failure. The detail may survive on only
+  // one of these exceptions, so check both.
+  if (exception.getDetail(jsg::EXCEPTION_DISABLE_ALARM_RETRY) != kj::none) return false;
+  KJ_IF_SOME(abortReason, context.getAbortReason()) {
+    return abortReason.getDetail(jsg::EXCEPTION_DISABLE_ALARM_RETRY) == kj::none;
+  }
+  return true;
+}
 }  // namespace
 
 kj::Promise<WorkerInterface::AlarmResult> ServiceWorkerGlobalScope::runAlarm(kj::Date scheduledTime,
@@ -669,6 +680,7 @@ kj::Promise<WorkerInterface::AlarmResult> ServiceWorkerGlobalScope::runAlarm(kj:
         auto description = kj::str(e.getDescription());  // because e is moved before this is used
         auto log = !jsg::isTunneledException(description) && !jsg::isDoNotLogException(description);
         auto isUserError = e.getDetail(jsg::EXCEPTION_IS_USER_ERROR) != kj::none;
+        auto retry = shouldRetryAlarm(e, context);
 
         // This will include the error in inspector/tracers and log to syslog if internal.
         context.logUncaughtExceptionAsync(UncaughtExceptionSource::ALARM_HANDLER, kj::mv(e));
@@ -709,7 +721,7 @@ kj::Promise<WorkerInterface::AlarmResult> ServiceWorkerGlobalScope::runAlarm(kj:
               "output lock broke during alarm execution without an interesting error description",
               actorId, description, shouldRetryCountsAgainstLimits);
         }
-        return WorkerInterface::AlarmResult{.retry = true,
+        return WorkerInterface::AlarmResult{.retry = retry,
           .retryCountsAgainstLimit = shouldRetryCountsAgainstLimits,
           .outcome = outcome,
           .errorDescription = kj::str(description)};
@@ -755,7 +767,7 @@ kj::Promise<WorkerInterface::AlarmResult> ServiceWorkerGlobalScope::runAlarm(kj:
                 "output lock broke after executing alarm with tunneled non-user error", actorId,
                 e.getDescription());
           }
-          return WorkerInterface::AlarmResult{.retry = true,
+          return WorkerInterface::AlarmResult{.retry = shouldRetryAlarm(e, context),
             .retryCountsAgainstLimit = shouldRetryCountsAgainstLimits,
             .outcome = EventOutcome::EXCEPTION,
             .errorDescription = kj::str(e.getDescription())};

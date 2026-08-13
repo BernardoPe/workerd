@@ -118,6 +118,7 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   struct RetryInfo {
     bool retry;
     bool retryCountsAgainstLimit;
+    EventOutcome outcome;
   };
   kj::Promise<RetryInfo> runAlarm(
       const ActorKey& actor, kj::Date scheduledTime, uint32_t retryCount);
