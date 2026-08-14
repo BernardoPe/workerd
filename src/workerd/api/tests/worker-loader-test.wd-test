@@ -5,8 +5,7 @@ const unitTests :Workerd.Config = (
     ( name = "worker-loader-test",
       worker = (
         modules = [
-          (name = "worker", esModule = embed "worker-loader-test.js"),
-          (name = "math.wasm", wasm = embed "test.wasm"),
+          (name = "worker", esModule = embed "worker-loader-test.js")
         ],
         compatibilityFlags = ["nodejs_compat","rpc","enable_ctx_exports","experimental"],
         bindings = [

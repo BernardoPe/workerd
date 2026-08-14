@@ -1123,11 +1123,19 @@ wd_test(
     size = "large",
     src = "worker-loader-test.wd-test",
     args = ["--experimental"],
+    data = ["worker-loader-test.js"],
+    tags = ["requires-network"],
+)
+
+wd_test(
+    src = "worker-loader-wasm-test.wd-test",
+    args = ["--experimental"],
     data = [
         "test.wasm",
-        "worker-loader-test.js",
+        "worker-loader-wasm-test.js",
     ],
-    tags = ["requires-network"],
+    # The test uses `import source` syntax, which eslint's parser does not yet support.
+    lint = False,
 )
 
 wd_test(
