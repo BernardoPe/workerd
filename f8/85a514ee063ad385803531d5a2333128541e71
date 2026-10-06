@@ -1,0 +1,29 @@
+types/defines/browser-run.d.ts
+  s_e1d7461d1a8822::t_009410d7da5fc1 119,126-137,166,214,253,286-287
+types/test/types/browser-run.ts
+  s_389aa8bfb4b14f::t_977c9aee9f79d1 1-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f885a514ee063ad385803531d5a2333128541e71",
+  "prompts": {},
+  "sessions": {
+    "s_389aa8bfb4b14f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f022761b6ffeDwKc838hYL9uGA",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "bpereira <bpereira@cloudflare.com>"
+    },
+    "s_e1d7461d1a8822": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f039ac9d0ffeQZMXoLnEhbaNG7",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "bpereira <bpereira@cloudflare.com>"
+    }
+  }
+}
